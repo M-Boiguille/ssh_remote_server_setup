@@ -1,0 +1,236 @@
+#!/bin/bash
+echo "=========== SSH Remote Server Setup ==========="
+echo "from roadmap.sh"
+
+# Needed variables
+server_name="ssh-remote-server-roadmap.sh"
+key1="roadmapkey1"
+key2="roadmapkey2"
+ssh_folder="keys_folder/" # custom folder for easy and risk free delete
+doctl_latest_url="https://github.com/digitalocean/doctl/releases/latest"
+digital_ocean_token="$DOTOKEN"
+
+echo "$server_name <<<==== the server NAME"
+if [[ $# -eq 1 ]]; then
+	digital_ocean_token=$1
+fi
+echo "$DOTOKEN"
+if [[ ${#digital_ocean_token} -lt 70 ]]; then
+	echo "Your token seems to be invalid (min. 64 characters)"
+	exit 1
+fi
+
+# Detect OS and architecture
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+case "$ARCH" in
+  x86_64)
+    ARCH="amd64"
+    ;;
+  arm64)
+    ARCH="arm64"
+    ;;
+  i386|i686)
+    ARCH="386"
+    ;;
+  *)
+    echo "Unsupported architecture: $ARCH"
+    exit 1
+    ;;
+esac
+
+version="-${OS}-${ARCH}.tar.gz"
+
+# download and install doctl
+echo "=== Check dotcl ==="
+if ! command -v doctl > /dev/null 2>&1; then
+	echo "doctl not installed: Install doctl"
+	link=$(curl -s -o /dev/null -w '%{redirect_url}' "$doctl_latest_url")
+	if [[ -z "$link" ]]; then
+		echo "Failed to fetch the latest doctl realease URL."
+		exit 1
+	fi
+	link=$( echo "$link" | sed 's/tag/download/' | \
+	awk -F'v' -v vers="$version" '{print $0 "/doctl-" $NF vers}' )
+	curl -L "$link" -o doctl.tar.gz
+	if [[ $? -ne 0 || -z "$link" ]]; then
+		echo "Error: Failed to fetch the latest doctl release URL."
+		exit 1
+	fi
+	if ! file doctl.tar.gz | grep -q 'gzip compressed data'; then
+		echo "Error: doctl: The downloaded file is not valid."
+		rm doctl.tar.gz
+		exit 1
+	fi
+	tar -xzf doctl.tar.gz
+	
+	if ! sudo mv doctl /usr/local/bin; then
+		echo "Error: sudo failed."
+		exit 1
+	fi
+	rm doctl.tar.gz
+else
+	echo "doctl: Already installed"
+fi
+
+# create ssh keys
+if ! mkdir -p "$ssh_folder"; then
+	echo "Error: no writing rights in this folder."
+	exit 1
+fi
+ssh-keygen -q -f "${ssh_folder}$key1" -N ''
+ssh-keygen -q -f "${ssh_folder}$key2" -N ''
+
+# connect account
+echo "Authenticate to Digitalocean"
+doctl auth init -t "$digital_ocean_token" --context "roadmap_sh"
+doctl account get
+
+# add ssh-keys to digitalocean
+doctl compute ssh-key import "$key1" \
+--public-key-file "${ssh_folder}${key1}.pub"
+doctl compute ssh-key import "$key2" \
+--public-key-file "${ssh_folder}${key2}.pub"
+ssh_keys_ids=$(doctl compute ssh-key list --no-header --format ID | tr '\n' ',' | sed 's/,$//')
+
+# create droplet
+echo "Create droplet"
+if doctl compute droplet list --no-header --format Name | grep -q "$server_name"; then
+    echo "A droplet named $server_name already exists."
+    exit 1
+fi
+
+if ! doctl compute droplet create "$server_name" \
+    --image ubuntu-24-04-x64 --size s-1vcpu-512mb-10gb \
+	--region ams3 \
+    --ssh-keys "$ssh_keys_ids"; then 
+    echo "Error: Failed to create the droplet."
+    exit 1
+fi
+
+# get ip adress
+droplet_ip=""
+fetch_ip_tries=60
+echo -n "Waiting for droplet initialization..."
+while [[ -z "$droplet_ip" ]]; do
+	echo -n "."
+	sleep 2
+	droplet_ip=$(doctl compute droplet list --no-header --format PublicIPv4)
+	fetch_ip_tries=$((fetch_ip_tries - 1))
+	if [[ $fetch_ip_tries -eq 0 ]]; then
+		echo ""
+		echo "Can't get IP adress, check your account !!!"
+		echo "Don't forget to delete the droplet if you don't use it!!!"
+		exit 1
+	fi
+done
+echo ""
+
+# job done, display and save ip
+echo "The droplet IP address is: $droplet_ip" | tee droplet_ip.txt
+
+# add aliases for new keys
+for key in "${key1}" "${key2}"; do
+    if ! grep -q "${key}" /home/${whoami}/config; then
+        cat <<EOL >> ~/.ssh/config
+
+Host ${key}
+    HostName ${droplet_ip}
+    User root
+    IdentityFile $(pwd)/${ssh_folder}${key}
+EOL
+        echo "Alias added for ${key}."
+    else
+        echo "Alias for ${key} already exists."
+    fi
+done
+
+
+echo "Configuring the server remotely..."
+
+# add machine to known hosts
+keyscan_tries=10
+echo -n "Attempting to fetch SSH key for $droplet_ip..."
+while [[ $keyscan_tries -gt 0 ]]; do
+	echo -n "."
+    if ssh-keyscan -H "$droplet_ip" >> ~/.ssh/known_hosts; then
+        echo "\tSSH key successfully added."
+        break
+    else
+       	keyscan_tries=$((keyscan_tries- 1))
+        sleep 5
+    fi
+	if [[ $keyscan_tries -eq 0 ]]; then
+        echo "\tError: fetching SSH key for $droplet_ip failed."
+	fi
+
+done
+
+# install and configure remote server
+ssh -i "${ssh_folder}${key1}" root@"$droplet_ip" bash -s <<EOF
+apt update > /dev/null
+apt install -y fail2ban 
+apt install -y ufw 
+apt install -y nginx 
+apt install -y certbot
+apt install -y python3-certbot-nginx
+
+if ! command -v certbot >/dev/null; then
+	snap install core
+	snap install --classic cerbot
+fi
+
+mkdir -p /var/www/website
+chown -R root:root /var/www/website
+chmod -R 755 /var/www/website
+ufw allow OpenSSH
+ufw allow 'Nginx Full'
+ufw --force enable
+
+cat << EOL > /etc/fail2ban/jail.local
+[sshd]
+enabled = true
+port = ssh
+logpath = /var/log/auth.log
+bantime = 3600
+findtime = 600
+maxretry = 5
+EOL
+
+cat <<EOL > /etc/nginx/sites-available/website
+server {
+    listen 80;
+    server_name $droplet_ip;
+
+    root /var/www/website;
+    index index.html;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOL
+
+ln -s /etc/nginx/sites-available/website /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
+systemctl restart fail2ban
+
+EOF
+
+if [[ $? -ne 0 ]]; then
+    echo "Error: Failed to configure the server."
+    exit 1
+fi
+
+scp -i "${ssh_folder}${key1}" "website/index.html" root@"$droplet_ip":/var/www/website/index.html
+
+# end message
+echo "The droplet IP address is: $droplet_ip"
+echo "you can connect with:"
+echo "    ssh -i ${ssh_folder}${key1} root@${droplet_ip} -or- ssh ${key1}"
+echo "    ssh -i ${ssh_folder}${key2} root@${droplet_ip} -or- ssh ${key2}"
+echo "================================================================="
+echo "Server setup is complete! Access your site at http://$droplet_ip"
+echo "Don't forget to delete the droplet if you don't use it!!!"
+
